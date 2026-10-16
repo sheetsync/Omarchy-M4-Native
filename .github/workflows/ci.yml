@@ -21,7 +21,8 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python -I -B tools/ci/diagnose-j713-fir.py --summary "$RUNNER_TEMP/j713-summary.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: j713-filter-baseline-summary
           path: ${{ runner.temp }}/j713-summary.json

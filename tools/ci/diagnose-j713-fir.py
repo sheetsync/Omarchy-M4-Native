@@ -10,12 +10,15 @@ import math
 import os
 from pathlib import Path
 import platform
-import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import urllib.request
+
+RELEASE_BASE = 'https://github.com/Kb2uka/Omarchy-M4-Native/releases/download/v0.1.0-alpha.1-update.2/'
+DOWNLOAD_MANIFEST_SHA256 = '561dfd6c2ebc44fe138b5ae70f80715a6568f4104764bbad99ef776553cafaa1'
 
 FRACTIONAL_BITS = (16, 20, 24, 28, 32, 36, 40, 44, 48, 52)
 
@@ -143,6 +146,50 @@ def summarize_scalar(workspace, source, numpy):
     return result
 
 
+def published_helpers(manifest, workspace):
+    """Fetch only the two hash-pinned regular helper files from the release tar."""
+    with urllib.request.urlopen(RELEASE_BASE + 'download-manifest.tsv', timeout=60) as response:
+        transport = response.read(200001)
+    require(len(transport) <= 200000 and digest(transport) == DOWNLOAD_MANIFEST_SHA256,
+            'Download manifest identity mismatch')
+    rows = [line.split('\t') for line in transport.decode().splitlines()]
+    companion = next(row for row in rows if row[0] == 'companion')
+    archive = next(row for row in rows if row[0] == 'archive')[1]
+    wanted = {'owner-audio/bundle/bin/' + name: name for name in manifest['helpers']}
+    offset = 0
+    result = {}
+    for row in rows:
+        if row[0] != 'file' or row[1] == archive:
+            continue
+        _, name, mode, size_text, pin = row
+        size = int(size_text)
+        if name in wanted:
+            helper = wanted[name]
+            owner_pin = manifest['helpers'][helper]
+            require((size, pin) == (owner_pin['size'], owner_pin['sha256']),
+                    'Transport and owner helper identities differ')
+            end = offset + 512 + size - 1
+            request = urllib.request.Request(RELEASE_BASE + companion[1],
+                                             headers={'Range': f'bytes={offset}-{end}'})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                require(response.status == 206 and response.headers.get('Content-Range') ==
+                        f'bytes {offset}-{end}/{companion[2]}', 'Release server refused exact byte range')
+                payload = response.read(512 + size + 1)
+            require(len(payload) == 512 + size, 'Unexpected ranged helper size')
+            header = tarfile.TarInfo.frombuf(payload[:512], 'utf-8', 'strict')
+            require(header.isfile() and header.name == name and header.size == size,
+                    'Unexpected companion tar entry')
+            data = payload[512:]
+            require(digest(data) == pin, 'Published helper identity mismatch')
+            destination = workspace / helper
+            destination.write_bytes(data)
+            destination.chmod(0o700)
+            result[helper] = pin
+        offset += 512 + ((size + 511) // 512) * 512
+    require(set(result) == set(manifest['helpers']), 'Published helper set incomplete')
+    return result
+
+
 def diagnose(root, workspace):
     require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'Native arm64 macOS required')
     require(sys.version_info[:3] == (3, 13, 9) and not sys.flags.optimize, 'CPython 3.13.9 required')
@@ -164,12 +211,7 @@ def diagnose(root, workspace):
         if name != 'AudioDSP':
             (workspace / 'source' / name).write_bytes(data)
     (workspace / 'owner-inputs.json').write_text(json.dumps({name: item['sha256'] for name, item in inputs.items()}))
-    helpers = workspace / 'helpers'
-    command(['/bin/bash', str(bundle / 'build-helpers.sh'), str(helpers)])
-    helper_hashes = {}
-    for name in owner.HELPER_NAMES:
-        helper_hashes[name] = digest((helpers / name).read_bytes())
-        shutil.copy2(helpers / name, workspace / name)
+    helper_hashes = published_helpers(manifest, workspace)
     wheel = workspace / manifest['numpy']['filename']
     with urllib.request.urlopen(manifest['numpy']['url'], timeout=60) as response:
         data = response.read(manifest['numpy']['size'] + 1)
@@ -190,27 +232,35 @@ def diagnose(root, workspace):
     (workspace / 'output').mkdir()
     run_stage(source, dependencies, workspace, 'run-memory.py')
     (workspace / 'output').rename(workspace / 'native-memory')
-    run_stage(source, dependencies, workspace, 'qualify_memory.py')
+    qualification_error = None
+    try:
+        run_stage(source, dependencies, workspace, 'qualify_memory.py')
+    except RuntimeError as error:
+        qualification_error = str(error)
     arrays = {str(path.relative_to(workspace)): summarize_samples(path, numpy, 73728)
               for directory in ('native-transfer', 'native-memory')
               for path in sorted((workspace / directory).glob('*.f32'))}
     outputs = {}
     for name, pin in manifest['outputs'].items():
+        if not (workspace / 'output' / name).is_file():
+            continue
         summary = summarize_samples(workspace / 'output' / name, numpy)
         summary['native_pin_match'] = (summary['size'], summary['sha256']) == (pin['size'], pin['sha256'])
         outputs[name] = summary
-    report = json.loads((workspace / 'output/qualified-memory.json').read_text())
+    report_path = workspace / 'output/qualified-memory.json'
+    report = json.loads(report_path.read_text()) if report_path.is_file() else None
     for name, record in manifest['owner_inputs'].items():
         data, matched = owner.qualified_input(record)
         require(inputs[name] == {'sha256': digest(data), 'size': len(data)}, 'Input changed during diagnostic')
     return {'schema': 1, 'purpose': 'baseline numerical diagnosis; no playback or installation',
             'macos': {'version': version, 'build': build}, 'python': platform.python_version(),
             'numpy': numpy.__version__, 'owner_inputs': inputs, 'source_sha256': source_hashes,
-            'helper_sha256': helper_hashes, 'compiler': command(['/usr/bin/clang', '--version']),
+            'helper_sha256': helper_hashes, 'helpers': 'exact published release bytes; not rebuilt',
+            'qualification_passed': qualification_error is None, 'qualification_error': qualification_error,
             'quantization': 'round-to-nearest-even(sample * 2**bits), little-endian signed int64',
             'outputs': outputs, 'raw_arrays': arrays,
-            'scalar_outputs': summarize_scalar(workspace, source, numpy),
-            'max_native_model_relative_error': max(row['relative_peak_error'] for row in report['native_memory_comparisons'])}
+            'scalar_outputs': summarize_scalar(workspace, source, numpy) if qualification_error is None else {},
+            'max_native_model_relative_error': max(row['relative_peak_error'] for row in report['native_memory_comparisons']) if report else None}
 
 
 def main():
@@ -224,6 +274,8 @@ def main():
     arguments.summary.parent.mkdir(parents=True, exist_ok=True)
     arguments.summary.write_text(serialized)
     print(serialized, end='')
+    if not summary['qualification_passed']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
