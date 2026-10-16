@@ -31,7 +31,10 @@ def digest(data):
 
 def command(arguments, **options):
     result = subprocess.run(arguments, capture_output=True, text=True, timeout=300, **options)
-    require(result.returncode == 0, 'Diagnostic subprocess failed: ' + str(arguments[0]))
+    stage = Path(arguments[-1]).name
+    require(result.returncode == 0,
+            f'Diagnostic subprocess failed ({stage}, exit {result.returncode}): '
+            + result.stderr[-4000:].strip())
     return result.stdout.strip()
 
 
