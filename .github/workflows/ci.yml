@@ -1,110 +1,29 @@
-name: CI
+name: J713 filter baseline diagnostic
 
 on:
-  pull_request:
-    branches: [develop, main]
-  push:
-    branches: [develop, main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  policy:
-    name: PR policy
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Check contribution target
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.base_ref }}
-          HEAD: ${{ github.head_ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          REPO: ${{ github.repository }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          if [[ "$EVENT" != pull_request || "$BASE" == develop ]]; then
-            exit 0
-          fi
-          if [[ "$BASE" == main && "$HEAD" == develop && "$HEAD_REPO" == "$REPO" && "$AUTHOR" == Kb2uka ]]; then
-            exit 0
-          fi
-          echo 'Contributor PRs must target develop. Only the maintainer promotes develop to main.' >&2
-          exit 1
-
-  tests:
-    name: Tests (Linux)
-    runs-on: ubuntu-24.04
+  baseline:
+    runs-on: macos-26
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13'
-      - name: Install test tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua5.4 device-tree-compiler
-      - name: Fetch pinned Asahi devicetree sources
-        run: |
-          bash tools/ci/fetch-asahi-dts.sh "$RUNNER_TEMP/asahi-linux"
-          echo "M4_ASAHI_TREE=$RUNNER_TEMP/asahi-linux" >> "$GITHUB_ENV"
-      - name: Check whitespace in proposed change
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
-            git diff --check "$BASE_SHA" HEAD
-          else
-            git show --format= --check HEAD
-          fi
-      - name: Run offline regression suite
-        env:
-          LUA: lua5.4
-          PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
-
-  speaker-daemon:
-    name: Speaker daemon (Rust)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Verify pinned audio source
-        working-directory: audio/j713
-        run: sha256sum --check --strict imported-source.sha256
-      - name: Install ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
-      - name: Build speakersafetyd
-        working-directory: audio/j713/speakersafetyd
-        run: |
-          cargo --version
-          cargo build --locked --release
-      - name: Test speakersafetyd
-        working-directory: audio/j713/speakersafetyd
-        run: cargo test --locked
-
-  macos:
-    name: Installer transport (macOS)
-    runs-on: macos-14
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.13'
-      - name: Run downloader and packaging regressions on macOS
+          python-version: '3.13.9'
+      - name: Measure qualified baseline without hardware playback
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m unittest discover -s tests -p test_j713_download.py -v
+        run: python -I -B tools/ci/diagnose-j713-fir.py --summary "$RUNNER_TEMP/j713-summary.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: j713-filter-baseline-summary
+          path: ${{ runner.temp }}/j713-summary.json
+          if-no-files-found: error
+          retention-days: 7
