@@ -109,7 +109,7 @@ def convolve_coefficients(first, second):
 def summarize_scalar(workspace, source, numpy):
     sys.path.insert(0, str(source))
     from analyze_transfer import AMP, IMPULSE, load, select_length, wav_float32
-    from qualify_memory import float_coeff
+    from qualify_memory import float_coeff, fft_convolve
     memory = workspace / 'native-memory'
     rows = {row['name']: row for row in json.loads((memory / 'memory-runs.json').read_text())}
     highpasses = []
@@ -118,6 +118,7 @@ def summarize_scalar(workspace, source, numpy):
         length, _ = select_length(response)
         highpasses.append(float_coeff(response[:length]))
     combined = convolve_coefficients(*highpasses)
+    fft_combined = fft_convolve(*highpasses)
     transfer = workspace / 'native-transfer'
     transfers = json.loads((transfer / 'transfers.json').read_text())
     directory = workspace / 'scalar-output'
@@ -135,14 +136,52 @@ def summarize_scalar(workspace, source, numpy):
         name = f'j713-static-minimal-lane{lane}-48000.wav'
         path = directory / name
         wav_float32(path, coefficients)
-        baseline = numpy.frombuffer(wav_samples((workspace / 'output' / name).read_bytes()),
-                                    dtype='<f4').astype(numpy.float64)
+        fft_full = fft_convolve(fft_combined, tone)
+        fft_length, _ = select_length(fft_full)
+        fft_coefficients = float_coeff(fft_full[:fft_length])
+        fft_path = directory / ('fft-' + name)
+        wav_float32(fft_path, fft_coefficients)
+        baseline = fft_coefficients
         require(len(baseline) == len(coefficients), 'Scalar tap count differs')
         difference = numpy.abs(baseline - coefficients)
         result[name] = {**summarize_samples(path, numpy),
+                        'unqualified_candidate': True,
+                        'independent_fft': summarize_samples(fft_path, numpy),
                         'versus_fft': {'different_samples': int(numpy.count_nonzero(difference)),
                                        'maximum_absolute_difference': float(numpy.max(difference)),
                                        'sum_absolute_differences': float(numpy.sum(difference))}}
+    return result
+
+
+def compare_highpass_channels(workspace, source, numpy):
+    """Compare channels without treating failed qualifier results as accepted."""
+    sys.path.insert(0, str(source))
+    from analyze_transfer import AMP, IMPULSE, select_length
+    result = {}
+    for label in ('hp90', 'hp80'):
+        for amplitude in ('0.0001', '0.0002'):
+            values = []
+            for lane in (0, 1):
+                path = workspace / 'native-memory' / f'{label}-amp{amplitude}-lane{lane}.f32'
+                values.append(numpy.frombuffer(path.read_bytes(), dtype='<f4').reshape(4, 73728)[lane].astype(numpy.float64))
+            difference = numpy.abs(values[0] - values[1])
+            differing = numpy.flatnonzero(difference)
+            try:
+                selected, _ = select_length(values[0][IMPULSE:] / float(amplitude))
+            except AssertionError:
+                selected = None
+            retained_end = IMPULSE + selected if selected is not None else IMPULSE
+            def portion(start, end):
+                part = difference[start:end]
+                return {'different_samples': int(numpy.count_nonzero(part)),
+                        'maximum_absolute_difference': float(numpy.max(part)) if part.size else 0,
+                        'sum_absolute_differences': float(numpy.sum(part))}
+            result[f'{label}-amp{amplitude}'] = {
+                'selected_taps_lane0': selected, 'unqualified_comparison': True,
+                'earliest_differing_frame': int(differing[0]) if differing.size else None,
+                'latest_differing_frame': int(differing[-1]) if differing.size else None,
+                'whole': portion(0, 73728), 'before_impulse': portion(0, IMPULSE),
+                'retained': portion(IMPULSE, retained_end), 'tail': portion(retained_end, 73728)}
     return result
 
 
@@ -252,6 +291,12 @@ def diagnose(root, workspace):
     for name, record in manifest['owner_inputs'].items():
         data, matched = owner.qualified_input(record)
         require(inputs[name] == {'sha256': digest(data), 'size': len(data)}, 'Input changed during diagnostic')
+    try:
+        scalar_outputs = summarize_scalar(workspace, source, numpy)
+        scalar_error = None
+    except (AssertionError, RuntimeError, ValueError) as error:
+        scalar_outputs = {}
+        scalar_error = type(error).__name__ + ': ' + str(error)
     return {'schema': 1, 'purpose': 'baseline numerical diagnosis; no playback or installation',
             'macos': {'version': version, 'build': build}, 'python': platform.python_version(),
             'numpy': numpy.__version__, 'owner_inputs': inputs, 'source_sha256': source_hashes,
@@ -259,7 +304,8 @@ def diagnose(root, workspace):
             'qualification_passed': qualification_error is None, 'qualification_error': qualification_error,
             'quantization': 'round-to-nearest-even(sample * 2**bits), little-endian signed int64',
             'outputs': outputs, 'raw_arrays': arrays,
-            'scalar_outputs': summarize_scalar(workspace, source, numpy) if qualification_error is None else {},
+            'scalar_outputs': scalar_outputs, 'scalar_error': scalar_error,
+            'highpass_channel_comparisons': compare_highpass_channels(workspace, source, numpy),
             'max_native_model_relative_error': max(row['relative_peak_error'] for row in report['native_memory_comparisons']) if report else None}
 
 
